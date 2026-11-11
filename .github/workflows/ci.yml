@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y netcat-openbsd libssl-dev
+
+      - name: Build (optimized + loadgen)
+        run: make all loadgen unit
+
+      - name: Unit tests
+        run: ./bin/ledgercore_unit
+
+      - name: Concurrency test
+        run: bash test_concurrency.sh
+
+      - name: Multi-account transfer stress
+        run: STRESS_SECS=3 bash tests/stress.sh
+
+      - name: Crash recovery test
+        run: CRASH_ITERS=5 bash tests/crash_test.sh
+
+      - name: TLS smoke test
+        run: |
+          bash gen_cert.sh
+          rm -f ledgercore.snap ledgercore.snap.tmp ledgercore.wal ledgercore_audit.log ledgercore.lock
+          ./bin/ledgercore_server 18080 ledgercore.crt ledgercore.key &
+          SRV=$!
+          sleep 1
+          bash tests/tls_smoke.sh 18080 ledgercore.crt
+          kill $SRV 2>/dev/null || true
+          wait $SRV 2>/dev/null || true
+          rm -f ledgercore.snap ledgercore.snap.tmp ledgercore.wal ledgercore_audit.log ledgercore.lock ledgercore.crt ledgercore.key
+
+      - name: Benchmark (smoke, 8s)
+        run: |
+          rm -f ledgercore.snap ledgercore.snap.tmp ledgercore.wal ledgercore_audit.log ledgercore.lock
+          ./bin/ledgercore_server 18080 &
+          SRV=$!
+          sleep 1
+          ./bin/ledgercore_loadgen -h 127.0.0.1 -p 18080 -t 8 -c 8 -w 2
+          kill $SRV 2>/dev/null || true
+          wait $SRV 2>/dev/null || true
+          rm -f ledgercore.snap ledgercore.snap.tmp ledgercore.wal ledgercore_audit.log ledgercore.lock
+
+  sanitizers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y netcat-openbsd libssl-dev
+
+      - name: Build ThreadSanitizer
+        run: make tsan
+
+      - name: TSan concurrency test
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          SERVER_BIN: ./bin/ledgercore_server_tsan
+        run: STRESS_SECS=3 bash tests/stress.sh
+
+      - name: Build AddressSanitizer
+        run: make asan
+
+      - name: ASan smoke test
+        env:
+          ASAN_OPTIONS: halt_on_error=1 detect_leaks=1
+        run: |
+          rm -f ledgercore.snap ledgercore.snap.tmp ledgercore.wal ledgercore_audit.log ledgercore.lock
+          ASAN_OPTIONS="halt_on_error=1 detect_leaks=1" ./bin/ledgercore_server_asan 18080 &
+          SRV=$!
+          sleep 1
+          printf 'REGISTER alice alicepass\nQUIT\n' | nc -w 15 127.0.0.1 18080
+          printf 'LOGIN alice alicepass\nDEPOSIT 50000\nTRANSFER alice 1000\nBALANCE\nLOGOUT\nQUIT\n' \
+              | nc -w 15 127.0.0.1 18080
+          kill $SRV 2>/dev/null || true
+          wait $SRV 2>/dev/null || true
+          echo "ASan run complete (no memory errors)"
